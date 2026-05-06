@@ -116,11 +116,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         1. Separate shared-embedding parameters (isolated buckets, emitted first).
         2. Pool the remaining parameters in backprop order, indexed by numel.
-        3. Pop the next unassigned parameter (size *S*) and assign it to shard 0.
+        3. Pop the next unassigned parameter and assign it to shard 0.
         4. For shards 1 … ``dp_size - 1``, assign the next unassigned parameter
-           of size *S* (also in backprop order).  If none is available, insert
-           padding of size *S*.  Every shard grows by exactly *S* elements, so
-           all shards stay the same size.
+           of the same numel (also in backprop order).  If none is available,
+           insert padding of that numel.  Every shard grows by the same amount,
+           so all shards stay the same size.
         5. When the bucket total reaches *bucket_size*, finalise the bucket
            (pad shard size to :meth:`_shard_divisor`) and start a new one.
         6. Repeat from 3 until all parameters are assigned.
@@ -173,16 +173,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 overall_cursor += 1
             return None
 
-        def _next_with_size(S: int) -> Optional[torch.nn.Parameter]:
-            """Next unassigned param of size *S* in backprop order."""
-            group = size_groups[S]
-            c = size_cursors[S]
+        def _next_with_size(param_numel: int) -> Optional[torch.nn.Parameter]:
+            """Next unassigned param of size *param_numel* in backprop order."""
+            group = size_groups[param_numel]
+            c = size_cursors[param_numel]
             while c < len(group):
                 if id(group[c]) not in assigned:
-                    size_cursors[S] = c
+                    size_cursors[param_numel] = c
                     return group[c]
                 c += 1
-            size_cursors[S] = c
+            size_cursors[param_numel] = c
             return None
 
         # -- 2. Output accumulators. --------------------------------------
@@ -246,22 +246,22 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             if param is None:
                 break
 
-            S = param.data.nelement()
+            param_numel = param.data.nelement()
             assigned.add(id(param))
-            shard_assignments[0].append((param, S))
-            bucket_unpadded += S
+            shard_assignments[0].append((param, param_numel))
+            bucket_unpadded += param_numel
 
             for shard_idx in range(1, dp_size):
-                match = _next_with_size(S)
+                match = _next_with_size(param_numel)
                 if match is not None:
                     assigned.add(id(match))
-                    shard_assignments[shard_idx].append((match, S))
-                    bucket_unpadded += S
+                    shard_assignments[shard_idx].append((match, param_numel))
+                    bucket_unpadded += param_numel
                 else:
-                    shard_assignments[shard_idx].append((None, S))
-                    size_match_padding_numel += S
+                    shard_assignments[shard_idx].append((None, param_numel))
+                    size_match_padding_numel += param_numel
 
-            shard_pos = pad_param_start(shard_pos) + S
+            shard_pos = pad_param_start(shard_pos) + param_numel
 
             if bucket_size is not None:
                 bucket_total = dp_size * pad_to_divisor(shard_pos, shard_div)
@@ -306,10 +306,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """Compute parameter layouts for all buffer groups with shard-aligned buckets.
 
         Groups parameters by :class:`BufferKey` via :func:`group_params_for_buffers`,
-        then delegates to :meth:`_compute_per_buffer_param_layout` (shard-aligned) for
-        buffers with ``use_layerwise_distributed_optimizer=True``, or to
-        :meth:`DistributedOptimizer._compute_per_buffer_param_layout` (standard) for
-        the remaining buffers.
+        then applies the shard-aligned layout to every buffer.  Separating params
+        into distinct buffers by ``use_layerwise_distributed_optimizer`` keeps
+        large 2D weights (Muon) apart from small biases/norms/embeddings (Adam),
+        minimizing size-matching padding overhead.
 
         Args:
             params: All parameters to lay out.
@@ -322,8 +322,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Returns:
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
         """
-        from .distrib_optimizer import DistributedOptimizer
-
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
@@ -336,14 +334,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             else:
                 dp_world_size = data_parallel_world_size
 
-            if buffer_key.use_layerwise_distributed_optimizer:
-                layout = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
-                    group_params, bucket_size, dp_world_size, ddp_config, param_indices
-                )
-            else:
-                layout = DistributedOptimizer._compute_per_buffer_param_layout(
-                    group_params, bucket_size, dp_world_size, ddp_config, param_indices
-                )
+            layout = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
+                group_params, bucket_size, dp_world_size, ddp_config, param_indices
+            )
             layouts[buffer_key] = layout
         return FullParamLayout(layouts=layouts)
 
