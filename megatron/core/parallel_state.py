@@ -99,6 +99,11 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 # A list of global ranks for each tensor model parallel group to ease calculation of
 # the first local rank in the tensor model parallel group
 _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+_ALL_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+
+# Tensor model parallel subgroup used when GQA has fewer KV groups than TP ranks.
+_GQA_TENSOR_MODEL_PARALLEL_GROUP = None
+_GQA_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
 # A list of global ranks for each expert model parallel group to ease calculation of
 # the first local rank in the expert model parallel group
@@ -997,10 +1002,13 @@ def initialize_model_parallel(
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    global _ALL_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
+    _ALL_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = []
     for ranks in decoder_rank_generator.get_ranks('tp'):
+        _ALL_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS.append(ranks)
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1453,6 +1461,66 @@ def get_tensor_model_parallel_group(check_initialized=True):
             _TENSOR_MODEL_PARALLEL_GROUP is not None
         ), "tensor model parallel group is not initialized"
     return _TENSOR_MODEL_PARALLEL_GROUP
+
+
+def initialize_gqa_tensor_model_parallel_group(num_query_groups: Optional[int]):
+    """Initialize TP subgroups that each own one complete GQA KV group.
+
+    This is used when ``num_query_groups < tensor_model_parallel_size``. In that case the
+    QKV projection's normal TP shard can split one GQA group across multiple TP ranks, so the
+    attention layer can gather only within this smaller subgroup instead of the whole TP group.
+    """
+    global _GQA_TENSOR_MODEL_PARALLEL_GROUP
+    global _GQA_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+
+    assert _TENSOR_MODEL_PARALLEL_GROUP is not None, "tensor model parallel group is not initialized"
+    assert (
+        _ALL_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS is not None
+    ), "all tensor model parallel ranks are not initialized"
+
+    _GQA_TENSOR_MODEL_PARALLEL_GROUP = None
+    _GQA_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+
+    if num_query_groups is None:
+        return
+
+    tp_size = get_tensor_model_parallel_world_size()
+    if num_query_groups >= tp_size or tp_size % num_query_groups != 0:
+        return
+
+    subgroup_size = tp_size // num_query_groups
+    rank = torch.distributed.get_rank()
+
+    for tp_group_idx, tp_ranks in enumerate(_ALL_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS):
+        assert len(tp_ranks) == tp_size, (len(tp_ranks), tp_size)
+        for group_idx in range(num_query_groups):
+            start = group_idx * subgroup_size
+            ranks = tp_ranks[start : start + subgroup_size]
+            group = create_group(
+                ranks=ranks,
+                group_desc=f"GQA_TENSOR_MODEL_PARALLEL_GROUP_{tp_group_idx}_{group_idx}",
+            )
+            if rank in ranks:
+                _GQA_TENSOR_MODEL_PARALLEL_GROUP = group
+                _GQA_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
+
+
+def get_gqa_tensor_model_parallel_group(check_initialized=True):
+    """Get the GQA tensor-model-parallel subgroup the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _GQA_TENSOR_MODEL_PARALLEL_GROUP is not None
+        ), "GQA tensor model parallel group is not initialized"
+    return _GQA_TENSOR_MODEL_PARALLEL_GROUP
+
+
+def get_gqa_tensor_model_parallel_global_ranks(check_initialized=True):
+    """Get all global ranks of the caller's GQA tensor-model-parallel subgroup."""
+    if check_initialized:
+        assert (
+            _GQA_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS is not None
+        ), "GQA tensor model parallel group is not initialized"
+    return _GQA_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
 
 
 def get_pipeline_model_parallel_group(check_initialized=True):
@@ -2097,6 +2165,18 @@ def destroy_model_parallel():
 
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
+
+    global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+
+    global _ALL_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    _ALL_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+
+    global _GQA_TENSOR_MODEL_PARALLEL_GROUP
+    _GQA_TENSOR_MODEL_PARALLEL_GROUP = None
+
+    global _GQA_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    _GQA_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None

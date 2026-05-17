@@ -23,6 +23,7 @@ from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
     get_data_parallel_world_size,
+    get_gqa_tensor_model_parallel_group,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -302,6 +303,12 @@ class Attention(MegatronModule, ABC):
             self.num_attention_heads_per_partition = divide(
                 self.config.num_attention_heads, self.config.num_query_groups
             )
+            default_tp_group = get_tensor_model_parallel_group(check_initialized=False)
+            self.gqa_tp_subgroup = (
+                get_gqa_tensor_model_parallel_group(check_initialized=False)
+                if self.pg_collection.tp is default_tp_group
+                else None
+            )
         else:
             # When num_kv_heads >= tp_size, each TP rank produces activations for
             # (num_kv_heads / tp_size) kv_heads and (num_q_heads / tp_size) q_heads.
@@ -309,6 +316,7 @@ class Attention(MegatronModule, ABC):
             self.num_attention_heads_per_partition = divide(
                 self.config.num_attention_heads, world_size
             )
+            self.gqa_tp_subgroup = None
         self.world_size = world_size
 
         # To support both CUDA Graphs and key value with different hidden size
@@ -1525,21 +1533,27 @@ class SelfAttention(Attention):
             # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
             # ranks, so a rank does not have a clean partitioning of just the q_heads
             # it needs. Instead, we perform the following steps:
-            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
-            #    through an AG.
-            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
+            # 1. Assemble the local "q1 q2 k1 v1" block through an AG across the
+            #    TP subgroup that owns the same KV group. If the subgroup cannot be
+            #    formed, fall back to full TP AG and slice out the local block.
+            # 2. Pull out the right slice when using the fallback full TP AG.
             # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
             # 4. Further index into query to get only the q_heads that this rank is
             #    responsible for (e.g., q1).
             # The block of code below performs steps 1 and 2.
-            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
-                mixed_qkv, group=self.pg_collection.tp
-            )
-            idx = get_pg_rank(self.pg_collection.tp) // (
-                self.world_size // self.config.num_query_groups
-            )
-            size = mixed_qkv.size()[-1] // self.config.num_query_groups
-            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
+            if self.gqa_tp_subgroup is not None:
+                mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+                    mixed_qkv, group=self.gqa_tp_subgroup
+                )
+            else:
+                mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+                    mixed_qkv, group=self.pg_collection.tp
+                )
+                idx = get_pg_rank(self.pg_collection.tp) // (
+                    self.world_size // self.config.num_query_groups
+                )
+                size = mixed_qkv.size()[-1] // self.config.num_query_groups
+                mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
 
         # If no output gate: [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         # If have output gate: [sq, b, hp] --> [sq, b, ng, (2 * np/ng + 2) * hn]

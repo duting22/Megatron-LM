@@ -359,6 +359,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
             )
+            mpu.initialize_gqa_tensor_model_parallel_group(args.num_query_groups)
             print_rank_0(
                 f"> initialized tensor model parallel with size "
                 f"{mpu.get_tensor_model_parallel_world_size()}"
